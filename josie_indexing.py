@@ -7,9 +7,9 @@ search algorithms implemented in ``josie_online``.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Iterable
 from hashlib import blake2b
+import logging
 
 import duckdb
 import pandas as pd
@@ -17,6 +17,9 @@ import polars as pl
 
 
 __all__ = ["build_josie_index_polars"]
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_josie_index_polars(
@@ -49,7 +52,7 @@ def build_josie_index_polars(
             "-",
             "--",
             "n/a",
-            "total",
+            # "total",
             "$",
             ":",
             "*",
@@ -63,7 +66,8 @@ def build_josie_index_polars(
     skip_tokens_normalized = {str(token).lower() for token in skip_tokens}
 
     # Step 0: Extract RawTokens (RawToken, SetID) and metadata (table_id, col_name, set_id)
-    raw_tokens = []
+    # raw_tokens = []
+    raw_df_list = []
     metadata = []
     set_counter = 0
     for table_id, df in dataframes_with_id:
@@ -71,15 +75,40 @@ def build_josie_index_polars(
         for col in df_pl.columns:
             set_id = set_counter
             set_counter += 1
-            tokens = df_pl[col].drop_nulls().cast(str).unique().to_list()
-            for t in tokens:
-                token_lower = t.lower()
-                # if t.lower() not in skip_tokens and not t.isnumeric():
-                if token_lower not in skip_tokens_normalized:
-                    raw_tokens.append((t, set_id))
-            metadata.append((table_id, col, set_id))
+            
+            
+            # tokens = df_pl[col].drop_nulls().cast(str).unique().to_list()
+            # for t in tokens:
+            #     token_lower = t.lower()
+            #     # if t.lower() not in skip_tokens and not t.isnumeric():
+            #     if token_lower not in skip_tokens_normalized:
+            #         raw_tokens.append((t, set_id))
+            col_df = (
+                df_pl[col]
+                .drop_nulls()
+                .cast(str)
+                .unique()
+                .to_frame()
+                .filter(
+                    ~pl.col(col).is_in(skip_tokens_normalized) #type: ignore
+                    # & ~pl.col(col).str.is_numeric()
+                )                
+                .select([
+                    pl.col(col).alias("raw_token"),
+                    pl.lit(set_id).alias("set_id")
+                ])
+            )
+            raw_df_list.append(col_df)
 
-    raw_df = pl.DataFrame(raw_tokens, schema=["raw_token", "set_id"], orient="row")
+            metadata.append((table_id, col, set_id))
+        if set_counter % 1_000_000 == 0:
+            logger.info("Processed %d sets", set_counter)
+
+    logger.info("Collected %d sets for indexing", set_counter)
+
+    # raw_df = pl.DataFrame(raw_tokens, schema=["raw_token", "set_id"], orient="row")
+    raw_df = pl.concat(raw_df_list, how="vertical")
+    
     meta_df = pl.DataFrame(
         metadata, schema=["table_id", "column_name", "set_id"], orient="row"
     )
@@ -98,6 +127,7 @@ def build_josie_index_polars(
         )
     )    
     # current schema of posting_lists: raw_token | set_id (list)
+    logger.info("Collected %d unique tokens for indexing", posting_lists.height)
 
     # Step 2: Assign TokenID & GroupID
     posting_lists = posting_lists.with_columns(
@@ -112,11 +142,13 @@ def build_josie_index_polars(
         ]
     )
     # current schema of posting_lists: raw_token | set_id (list) | frequency | hash
+    logger.debug("Computed token frequencies and hashes")
 
     posting_lists_sorted = (
         posting_lists.sort(["frequency", "hash", "_sort_key"]).drop("_sort_key")
     ).with_row_index(name="token_id")
     # current schema of posting_lists_sorted: token_id | raw_token | set_id (list) | frequency | hash
+    logger.debug("Sorted tokens by frequency and hash")
 
     # Deduplicate by assigning group ids
     posting_lists_sorted = posting_lists_sorted.with_columns(
@@ -125,6 +157,7 @@ def build_josie_index_polars(
         .alias("is_new_group")
     ).with_columns(pl.col("is_new_group").cast(pl.Int64).cum_sum().alias("group_id"))
     # current schema of posting_lists_sorted: token_id | raw_token | set_id (list) | frequency | hash | group_id
+    logger.debug("Assigned duplicate group ids")
 
     # posting_lists_sorted = posting_lists_sorted.with_columns(
     #     posting_lists_sorted.group_by("group_id").agg(pl.len()).rename({"count": "group_count"})["group_count"].over("group_id")
@@ -133,6 +166,7 @@ def build_josie_index_polars(
         pl.len().over("group_id").alias("group_count")
     )
     # current schema of posting_lists_sorted: token_id | raw_token | set_id (list) | frequency | hash | group_id | group_count
+    logger.debug("Computed duplicate group counts")
 
     # Step 3: Build Integer Sets (SetID -> TokenIDs)
     token_map = raw_df.join(
@@ -142,19 +176,21 @@ def build_josie_index_polars(
     )
     # schema of raw_df: raw_token | set_id
     # schema of token_map: raw_token | set_id | token_id | group_id | frequency
+    logger.debug("Joined tokens back to raw tokens")
 
     token_map = token_map.with_columns(
         (pl.col("frequency") > 1).cast(pl.Int64).alias("is_non_singular")
     )
     # schema of token_map: raw_token | set_id | token_id | group_id | frequency | is_non_singular
+    logger.debug("Identified non-singular tokens")
 
     set_to_tokens = token_map.group_by("set_id").agg(
         pl.col("token_id").sort().alias("token_id"),
         pl.len().alias("size"),
         pl.sum("is_non_singular").alias("num_non_singular_token"),
     )
-
     # schema of set_to_tokens: set_id | token_id (list) | size | num_non_singular_token
+    logger.debug("Grouped tokens into sets")
 
     # Step 4: Build final Posting Lists (TokenID -> SetIDs, sizes, positions)
     inv_map = []
@@ -180,6 +216,7 @@ def build_josie_index_polars(
         on="token_id",
         how="left",
     )
+    logger.info("Built final posting lists")
 
     # Step 5: Save results into DuckDB
     con = duckdb.connect(database=db_path)

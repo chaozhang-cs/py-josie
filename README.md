@@ -63,7 +63,7 @@ set_total_number_of_sets(con.execute("SELECT COUNT(*) FROM sets").fetchone()[0])
 token_table = TokenTable(con, "inverted_lists", ignoreSelf=True)
 
 query = rawTokenSet(ID=None, RawTokens=[b"apple", b"banana"], Tokens=None)
-results, _ = searchProbeSetOptimized(
+results, _ = searchMergeProbeCostModelGreedy(
     con,
     list_table="inverted_lists",
     set_table="sets",
